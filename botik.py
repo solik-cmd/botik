@@ -1,0 +1,858 @@
+import asyncio
+import random
+import sqlite3
+import logging
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# ========== НАСТРОЙКИ ==========
+TOKEN = "8032635677:AAFi83m59Q8kcUxgvUwo7Y6Z13AwYAQKVpk"
+REVIEW_CHAT_ID = -5235029911  # ID канала/группы для отзывов (можно оставить как есть или изменить)
+
+# ========== ЛОГИРОВАНИЕ ==========
+logging.basicConfig(level=logging.INFO)
+
+# ========== БАЗА ДАННЫХ SQLITE ==========
+conn = sqlite3.connect('game_bot.db')
+cursor = conn.cursor()
+
+# Создание таблиц
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    games_played INTEGER DEFAULT 0,
+    games_won INTEGER DEFAULT 0,
+    minesweeper_best_time REAL DEFAULT NULL,
+    guess_attempts_best INTEGER DEFAULT NULL,
+    rps_wins INTEGER DEFAULT 0,
+    coins INTEGER DEFAULT 0,
+    daily_last TIMESTAMP DEFAULT NULL,
+    referrer_id INTEGER DEFAULT NULL
+)
+''')
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    review_text TEXT,
+    rating INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS referrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    referred_id INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
+conn.commit()
+
+# Функции для работы с БД
+def update_user_stats(user_id, username, first_name, **kwargs):
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)',
+                   (user_id, username, first_name))
+    for key, value in kwargs.items():
+        cursor.execute(f'UPDATE users SET {key} = {key} + ? WHERE user_id = ?', (value, user_id))
+    conn.commit()
+
+def get_user_stats(user_id):
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    return cursor.fetchone()
+
+def can_daily(user_id):
+    cursor.execute('SELECT daily_last FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return True
+    last = datetime.fromisoformat(row[0])
+    return datetime.now() - last > timedelta(days=1)
+
+def update_daily(user_id):
+    cursor.execute('UPDATE users SET daily_last = ? WHERE user_id = ?', 
+                   (datetime.now().isoformat(), user_id))
+    conn.commit()
+
+def add_coins(user_id, amount):
+    cursor.execute('UPDATE users SET coins = coins + ? WHERE user_id = ?', (amount, user_id))
+    conn.commit()
+
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# ========== ХРАНИЛИЩА ИГР ==========
+minesweeper_games = {}
+tictactoe_games = {}
+guess_games = {}
+rps_games = {}
+
+# ========== САПЁР (MINESWEEPER) ==========
+MS_DIFFICULTY = {
+    'easy': {'rows': 5, 'cols': 5, 'mines': 5, 'name': 'Лёгкая (5x5, 5 мин)'},
+    'medium': {'rows': 8, 'cols': 8, 'mines': 10, 'name': 'Средняя (8x8, 10 мин)'},
+    'hard': {'rows': 10, 'cols': 10, 'mines': 15, 'name': 'Сложная (10x10, 15 мин)'}
+}
+
+def ms_new_board(rows, cols, mines, first_r, first_c):
+    board = [[0 for _ in range(cols)] for _ in range(rows)]
+    all_positions = [(r, c) for r in range(rows) for c in range(cols) if (r, c) != (first_r, first_c)]
+    mine_positions = random.sample(all_positions, mines)
+    for r, c in mine_positions:
+        board[r][c] = -1
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols and board[nr][nc] != -1:
+                    board[nr][nc] += 1
+    return board, set(mine_positions)
+
+def ms_get_keyboard(board, opened, flags, rows, cols, mode):
+    keyboard = []
+    for r in range(rows):
+        row_buttons = []
+        for c in range(cols):
+            if (r, c) in flags:
+                text = '🚩'
+            elif (r, c) in opened:
+                cell = board[r][c]
+                if cell == -1:
+                    text = '💣'
+                elif cell == 0:
+                    text = '⬛'
+                else:
+                    text = str(cell)
+            else:
+                text = '⬜'
+            callback_data = f"ms_cell_{r}_{c}"
+            row_buttons.append(InlineKeyboardButton(text=text, callback_data=callback_data))
+        keyboard.append(row_buttons)
+    mode_text = "⛏ Копать" if mode == 'flag' else "🚩 Флаг"
+    mode_button = [InlineKeyboardButton(text=f"Режим: {mode_text}", callback_data="ms_toggle_mode")]
+    keyboard.append(mode_button)
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+async def ms_open_cell(game_key, r, c, callback):
+    game = minesweeper_games[game_key]
+    board = game['board']
+    opened = game['opened']
+    mines = game['mines']
+    flags = game['flags']
+    rows, cols = game['rows'], game['cols']
+    mode = game['mode']
+
+    if (r, c) in flags:
+        await callback.answer("Сначала снимите флаг!")
+        return
+
+    if board is None:
+        board, mines = ms_new_board(rows, cols, game['mines_count'], r, c)
+        game['board'] = board
+        game['mines'] = mines
+        game['opened'].add((r, c))
+        if board[r][c] == 0:
+            await ms_open_zeros(board, opened, mines, rows, cols, r, c)
+        await ms_update_board(callback, game_key)
+        return
+
+    if (r, c) in opened:
+        await callback.answer("Клетка уже открыта")
+        return
+
+    if (r, c) in mines:
+        opened.update(mines)
+        keyboard = ms_get_keyboard(board, opened, flags, rows, cols, mode)
+        await callback.message.edit_text(
+            f"💥 Вы наступили на мину! Игра окончена.\n/minesweeper — новая игра",
+            reply_markup=keyboard
+        )
+        del minesweeper_games[game_key]
+        await callback.answer()
+        return
+
+    opened.add((r, c))
+    if board[r][c] == 0:
+        await ms_open_zeros(board, opened, mines, rows, cols, r, c)
+
+    await ms_check_win(callback, game_key)
+
+async def ms_open_zeros(board, opened, mines, rows, cols, r, c):
+    queue = [(r, c)]
+    visited = {(r, c)}
+    while queue:
+        cr, cc = queue.pop(0)
+        for dr, dc in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
+            nr, nc = cr + dr, cc + dc
+            if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in visited:
+                if (nr, nc) not in mines:
+                    visited.add((nr, nc))
+                    opened.add((nr, nc))
+                    if board[nr][nc] == 0:
+                        queue.append((nr, nc))
+
+async def ms_check_win(callback, game_key):
+    game = minesweeper_games[game_key]
+    opened = game['opened']
+    mines = game['mines']
+    rows, cols = game['rows'], game['cols']
+    total_cells = rows * cols
+    safe_cells = total_cells - len(mines)
+
+    if len(opened) == safe_cells:
+        opened.update(mines)
+        keyboard = ms_get_keyboard(game['board'], opened, game['flags'], rows, cols, game['mode'])
+        await callback.message.edit_text(
+            f"🎉 Поздравляю! Вы открыли все безопасные клетки! +50 монет",
+            reply_markup=keyboard
+        )
+        user = callback.from_user
+        update_user_stats(user.id, user.username, user.first_name, games_played=1, games_won=1)
+        add_coins(user.id, 50)
+        del minesweeper_games[game_key]
+        await callback.answer()
+        return
+
+    await ms_update_board(callback, game_key)
+
+async def ms_update_board(callback, game_key):
+    game = minesweeper_games[game_key]
+    board = game['board']
+    opened = game['opened']
+    flags = game['flags']
+    rows, cols = game['rows'], game['cols']
+    mode = game['mode']
+    safe_cells = rows * cols - len(game['mines'])
+    keyboard = ms_get_keyboard(board, opened, flags, rows, cols, mode)
+    await callback.message.edit_text(
+        f"Сапёр ({game['difficulty_name']})\n"
+        f"Открыто {len(opened)}/{safe_cells} безопасных клеток",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+# ========== КРЕСТИКИ-НОЛИКИ ==========
+def ttt_new_game():
+    return [[' ' for _ in range(3)] for _ in range(3)]
+
+def ttt_check_winner(board):
+    for i in range(3):
+        if board[i][0] == board[i][1] == board[i][2] != ' ':
+            return board[i][0]
+        if board[0][i] == board[1][i] == board[2][i] != ' ':
+            return board[0][i]
+    if board[0][0] == board[1][1] == board[2][2] != ' ':
+        return board[0][0]
+    if board[0][2] == board[1][1] == board[2][0] != ' ':
+        return board[0][2]
+    if all(cell != ' ' for row in board for cell in row):
+        return 'draw'
+    return None
+
+def ttt_get_keyboard(board):
+    keyboard = []
+    for r in range(3):
+        row_buttons = []
+        for c in range(3):
+            text = board[r][c]
+            if text == ' ':
+                text = '⬜'
+            elif text == 'X':
+                text = '❌'
+            elif text == 'O':
+                text = '⭕'
+            callback_data = f"ttt_move_{r}_{c}"
+            row_buttons.append(InlineKeyboardButton(text=text, callback_data=callback_data))
+        keyboard.append(row_buttons)
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def ttt_bot_move(board):
+    empty = [(r, c) for r in range(3) for c in range(3) if board[r][c] == ' ']
+    return random.choice(empty) if empty else None
+
+# ========== КАМЕНЬ-НОЖНИЦЫ-БУМАГА ==========
+RPS_EMOJI = {'камень': '🪨', 'ножницы': '✂️', 'бумага': '📄'}
+RPS_BEATS = {'камень': 'ножницы', 'ножницы': 'бумага', 'бумага': 'камень'}
+
+def rps_get_keyboard():
+    kb = [
+        [InlineKeyboardButton(text=f"{RPS_EMOJI['камень']} Камень", callback_data="rps_камень")],
+        [InlineKeyboardButton(text=f"{RPS_EMOJI['ножницы']} Ножницы", callback_data="rps_ножницы")],
+        [InlineKeyboardButton(text=f"{RPS_EMOJI['бумага']} Бумага", callback_data="rps_бумага")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# ========== НОВЫЕ ИГРЫ (DICE, BASKETBALL и т.д.) ==========
+@dp.message(Command("dice"))
+async def cmd_dice(message: types.Message):
+    user_roll = random.randint(1, 6)
+    bot_roll = random.randint(1, 6)
+    if user_roll > bot_roll:
+        result = "🎉 Вы выиграли! +20 монет"
+        add_coins(message.from_user.id, 20)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    elif user_roll < bot_roll:
+        result = "🤖 Бот выиграл!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    else:
+        result = "🤝 Ничья!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    
+    await message.reply(f"🎲 Ваш бросок: {user_roll}\n🤖 Бот: {bot_roll}\n\n{result}")
+
+@dp.message(Command("basketball"))
+async def cmd_basketball(message: types.Message):
+    user_score = random.randint(0, 30)
+    bot_score = random.randint(0, 30)
+    if user_score > bot_score:
+        result = "🏆 Вы победили! +25 монет"
+        add_coins(message.from_user.id, 25)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    elif user_score < bot_score:
+        result = "🤖 Бот победил!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    else:
+        result = "🤝 Ничья!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    
+    await message.reply(f"🏀 Ваш счёт: {user_score}\n🤖 Бот: {bot_score}\n\n{result}")
+
+@dp.message(Command("football"))
+async def cmd_football(message: types.Message):
+    user_goals = random.randint(0, 5)
+    bot_goals = random.randint(0, 5)
+    if user_goals > bot_goals:
+        result = "⚽ Гол! Вы выиграли! +25 монет"
+        add_coins(message.from_user.id, 25)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    elif user_goals < bot_goals:
+        result = "🤖 Бот забил больше..."
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    else:
+        result = "🤝 Ничья!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    
+    await message.reply(f"⚽ Ваши голы: {user_goals}\n🤖 Голы бота: {bot_goals}\n\n{result}")
+
+@dp.message(Command("bowling"))
+async def cmd_bowling(message: types.Message):
+    user_pins = random.randint(0, 10)
+    bot_pins = random.randint(0, 10)
+    if user_pins > bot_pins:
+        result = "🎳 Страйк! Вы выиграли! +25 монет"
+        add_coins(message.from_user.id, 25)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    elif user_pins < bot_pins:
+        result = "🤖 Бот выбил больше..."
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    else:
+        result = "🤝 Ничья!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    
+    await message.reply(f"🎳 Ваши кегли: {user_pins}\n🤖 Кегли бота: {bot_pins}\n\n{result}")
+
+@dp.message(Command("darts"))
+async def cmd_darts(message: types.Message):
+    user_score = random.randint(0, 180)
+    bot_score = random.randint(0, 180)
+    if user_score > bot_score:
+        result = "🎯 Меткий бросок! +25 монет"
+        add_coins(message.from_user.id, 25)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    elif user_score < bot_score:
+        result = "🤖 Бот точнее..."
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    else:
+        result = "🤝 Ничья!"
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    
+    await message.reply(f"🎯 Ваши очки: {user_score}\n🤖 Очки бота: {bot_score}\n\n{result}")
+
+@dp.message(Command("slot"))
+async def cmd_slot(message: types.Message):
+    emojis = ['🍒', '🍋', '🍊', '🍇', '💎', '7️⃣']
+    slots = [random.choice(emojis) for _ in range(3)]
+    result_text = ' '.join(slots)
+    
+    if slots[0] == slots[1] == slots[2]:
+        if slots[0] == '7️⃣':
+            result = "🎰 ДЖЕКПОТ! +100 монет"
+            add_coins(message.from_user.id, 100)
+        else:
+            result = "🎰 Три в ряд! +50 монет"
+            add_coins(message.from_user.id, 50)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    elif slots[0] == slots[1] or slots[1] == slots[2] or slots[0] == slots[2]:
+        result = "🎰 Два совпадения! +10 монет"
+        add_coins(message.from_user.id, 10)
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1, games_won=1)
+    else:
+        result = "🎰 Не повезло..."
+        update_user_stats(message.from_user.id, message.from_user.username, 
+                         message.from_user.first_name, games_played=1)
+    
+    await message.reply(f"{result_text}\n\n{result}")
+
+# ========== ЕЖЕДНЕВНЫЙ БОНУС ==========
+@dp.message(Command("daily"))
+async def cmd_daily(message: types.Message):
+    user_id = message.from_user.id
+    if can_daily(user_id):
+        add_coins(user_id, 50)
+        update_daily(user_id)
+        await message.reply("✅ Вы получили 50 монет за ежедневный вход!")
+    else:
+        await message.reply("⏳ Вы уже получали бонус сегодня. Приходите завтра!")
+
+# ========== СТАТИСТИКА ==========
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    user_id = message.from_user.id
+    stats = get_user_stats(user_id)
+    if stats:
+        text = (
+            f"📊 <b>Статистика {message.from_user.full_name}</b>\n\n"
+            f"🎮 Игр сыграно: {stats[3]}\n"
+            f"🏆 Побед: {stats[4]}\n"
+            f"💰 Монет: {stats[8]}\n"
+            f"🎯 Лучшее в угадайке: {stats[6] if stats[6] else '—'}"
+        )
+    else:
+        text = "У вас пока нет статистики. Сыграйте в любую игру!"
+    await message.reply(text)
+
+# ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
+@dp.message(Command("referral"))
+async def cmd_referral(message: types.Message):
+    user_id = message.from_user.id
+    bot_info = await bot.get_me()
+    referral_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+    await message.reply(
+        f"🔗 Ваша реферальная ссылка:\n{referral_link}\n\n"
+        f"За каждого друга, который перейдёт по ссылке и начнёт играть, вы получите 100 монет!"
+    )
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    args = message.text.split()
+    user_id = message.from_user.id
+    
+    # Проверка реферала
+    if len(args) > 1 and args[1].startswith('ref_'):
+        referrer_id = int(args[1].split('_')[1])
+        if referrer_id != user_id:  # Нельзя пригласить самого себя
+            cursor.execute('INSERT OR IGNORE INTO referrals (user_id, referred_id) VALUES (?, ?)',
+                          (referrer_id, user_id))
+            cursor.execute('UPDATE users SET referrer_id = ? WHERE user_id = ?',
+                          (referrer_id, user_id))
+            add_coins(referrer_id, 100)
+            conn.commit()
+            await bot.send_message(referrer_id, f"🎉 По вашей ссылке зарегистрировался новый пользователь! +100 монет")
+    
+    await message.reply(
+        "👋 Привет! Я игровой бот.\n\n"
+        "🎮 <b>Игры:</b>\n"
+        "• /minesweeper - Сапёр\n"
+        "• /tictactoe - Крестики-нолики\n"
+        "• /guess - Угадай число\n"
+        "• /rps - Камень-ножницы-бумага\n"
+        "• /dice - Кости\n"
+        "• /basketball - Баскетбол\n"
+        "• /football - Футбол\n"
+        "• /bowling - Боулинг\n"
+        "• /darts - Дротики\n"
+        "• /slot - Слот-машина\n\n"
+        "💰 <b>Дополнительно:</b>\n"
+        "• /daily - Ежедневный бонус\n"
+        "• /referral - Реферальная ссылка\n"
+        "• /review - Оставить отзыв\n"
+        "• /stats - Моя статистика\n"
+        "• /leaderboard - Таблица лидеров"
+    )
+
+# ========== ОТЗЫВЫ ==========
+@dp.message(Command("review"))
+async def cmd_review(message: types.Message):
+    await message.reply(
+        "📝 Пожалуйста, отправьте одним сообщением ваш отзыв и оценку от 1 до 5.\n"
+        "Пример: <code>Отличный бот! 5</code>\n\n"
+        "⚠️ Можно оставлять только 1 отзыв в день."
+    )
+
+@dp.message(lambda msg: msg.text and not msg.text.startswith('/'))
+async def handle_review(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text
+    
+    # Проверяем, есть ли сегодня отзыв
+    cursor.execute('''
+        SELECT COUNT(*) FROM reviews 
+        WHERE user_id = ? AND date(created_at) = date('now')
+    ''', (user_id,))
+    today_reviews = cursor.fetchone()[0]
+    
+    if today_reviews >= 1:
+        await message.reply("⏳ Вы уже оставляли отзыв сегодня. Попробуйте завтра!")
+        return
+    
+    # Парсим оценку
+    words = text.split()
+    rating = None
+    for word in words:
+        if word.isdigit() and 1 <= int(word) <= 5:
+            rating = int(word)
+            break
+    
+    if not rating:
+        await message.reply("❌ Пожалуйста, укажите оценку от 1 до 5 в сообщении.")
+        return
+    
+    # Сохраняем отзыв
+    cursor.execute('''
+        INSERT INTO reviews (user_id, username, review_text, rating)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, message.from_user.username or "no_username", text, rating))
+    conn.commit()
+    
+    # Отправляем в канал, если он указан
+    if REVIEW_CHAT_ID:
+        try:
+            await bot.send_message(
+                REVIEW_CHAT_ID,
+                f"⭐ <b>Новый отзыв</b>\n"
+                f"От: {message.from_user.full_name} (@{message.from_user.username})\n"
+                f"Оценка: {rating}/5\n"
+                f"Текст: {text}"
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить отзыв в канал: {e}")
+    
+    # Награда за отзыв
+    add_coins(user_id, 30)
+    await message.reply("✅ Спасибо за отзыв! Вы получили 30 монет.")
+
+# ========== КОМАНДЫ САПЁРА ==========
+@dp.message(Command("minesweeper"))
+async def cmd_minesweeper(message: types.Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=MS_DIFFICULTY['easy']['name'], callback_data="ms_diff_easy")],
+        [InlineKeyboardButton(text=MS_DIFFICULTY['medium']['name'], callback_data="ms_diff_medium")],
+        [InlineKeyboardButton(text=MS_DIFFICULTY['hard']['name'], callback_data="ms_diff_hard")]
+    ])
+    await message.reply("Выберите сложность:", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("ms_diff_"))
+async def ms_difficulty_callback(callback: CallbackQuery):
+    diff = callback.data.split('_')[2]
+    config = MS_DIFFICULTY[diff]
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    game_key = (chat_id, user_id)
+
+    minesweeper_games[game_key] = {
+        'board': None,
+        'opened': set(),
+        'flags': set(),
+        'mines': None,
+        'rows': config['rows'],
+        'cols': config['cols'],
+        'mines_count': config['mines'],
+        'difficulty_name': config['name'],
+        'mode': 'dig'
+    }
+
+    dummy_board = [[0 for _ in range(config['cols'])] for _ in range(config['rows'])]
+    keyboard = ms_get_keyboard(dummy_board, set(), set(), config['rows'], config['cols'], 'dig')
+    await callback.message.edit_text(
+        f"Сапёр ({config['name']})\n"
+        "Нажмите на любую клетку, чтобы начать (первый ход безопасен).",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("ms_cell_"))
+async def ms_cell_callback(callback: CallbackQuery):
+    _, _, r_str, c_str = callback.data.split('_')
+    r, c = int(r_str), int(c_str)
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    game_key = (chat_id, user_id)
+
+    if game_key not in minesweeper_games:
+        await callback.answer("Игра не найдена. Начните /minesweeper")
+        await callback.message.delete()
+        return
+
+    game = minesweeper_games[game_key]
+    if game['mode'] == 'dig':
+        await ms_open_cell(game_key, r, c, callback)
+    else:
+        flags = game['flags']
+        if (r, c) in game['opened']:
+            await callback.answer("Нельзя ставить флаг на открытую клетку!")
+            return
+        if (r, c) in flags:
+            flags.remove((r, c))
+        else:
+            flags.add((r, c))
+        await ms_update_board(callback, game_key)
+
+@dp.callback_query(lambda c: c.data == "ms_toggle_mode")
+async def ms_toggle_mode(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    game_key = (chat_id, user_id)
+    if game_key in minesweeper_games:
+        game = minesweeper_games[game_key]
+        game['mode'] = 'flag' if game['mode'] == 'dig' else 'dig'
+        await ms_update_board(callback, game_key)
+    else:
+        await callback.answer("Нет активной игры")
+
+# ========== КРЕСТИКИ-НОЛИКИ ==========
+@dp.message(Command("tictactoe"))
+async def cmd_tictactoe(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    game_key = (chat_id, user_id)
+    if game_key in tictactoe_games:
+        await message.reply("У вас уже есть активная игра! /cancel_ttt чтобы выйти.")
+        return
+    board = ttt_new_game()
+    tictactoe_games[game_key] = {'board': board, 'turn': 'player'}
+    keyboard = ttt_get_keyboard(board)
+    await message.reply("Крестики-нолики. Вы ❌, ваш ход:", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("ttt_move_"))
+async def ttt_move_callback(callback: CallbackQuery):
+    _, _, r_str, c_str = callback.data.split('_')
+    r, c = int(r_str), int(c_str)
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    game_key = (chat_id, user_id)
+
+    if game_key not in tictactoe_games:
+        await callback.answer("Игра не найдена")
+        await callback.message.delete()
+        return
+
+    game = tictactoe_games[game_key]
+    board = game['board']
+    if board[r][c] != ' ':
+        await callback.answer("Клетка занята!")
+        return
+    if game['turn'] != 'player':
+        await callback.answer("Сейчас не ваш ход!")
+        return
+
+    board[r][c] = 'X'
+    game['turn'] = 'bot'
+    result = ttt_check_winner(board)
+    if result:
+        await ttt_game_over(callback, game_key, result)
+        return
+
+    bot_move = ttt_bot_move(board)
+    if bot_move:
+        br, bc = bot_move
+        board[br][bc] = 'O'
+        game['turn'] = 'player'
+        result = ttt_check_winner(board)
+        if result:
+            await ttt_game_over(callback, game_key, result)
+            return
+    else:
+        await ttt_game_over(callback, game_key, 'draw')
+        return
+
+    keyboard = ttt_get_keyboard(board)
+    await callback.message.edit_text("Ваш ход:", reply_markup=keyboard)
+    await callback.answer()
+
+async def ttt_game_over(callback, game_key, result):
+    game = tictactoe_games[game_key]
+    board = game['board']
+    coins_reward = 0
+    if result == 'X':
+        text = "🎉 Вы выиграли! +30 монет"
+        coins_reward = 30
+        update_user_stats(callback.from_user.id, callback.from_user.username,
+                         callback.from_user.first_name, games_played=1, games_won=1)
+    elif result == 'O':
+        text = "🤖 Бот выиграл!"
+        update_user_stats(callback.from_user.id, callback.from_user.username,
+                         callback.from_user.first_name, games_played=1)
+    else:
+        text = "🤝 Ничья!"
+        update_user_stats(callback.from_user.id, callback.from_user.username,
+                         callback.from_user.first_name, games_played=1)
+    
+    if coins_reward:
+        add_coins(callback.from_user.id, coins_reward)
+    
+    keyboard = ttt_get_keyboard(board)
+    await callback.message.edit_text(f"{text}\nНовая игра: /tictactoe", reply_markup=keyboard)
+    del tictactoe_games[game_key]
+    await callback.answer()
+
+@dp.message(Command("cancel_ttt"))
+async def cancel_ttt(message: types.Message):
+    game_key = (message.chat.id, message.from_user.id)
+    if game_key in tictactoe_games:
+        del tictactoe_games[game_key]
+        await message.reply("Игра отменена.")
+    else:
+        await message.reply("Нет активной игры.")
+
+# ========== УГАДАЙ ЧИСЛО ==========
+@dp.message(Command("guess"))
+async def cmd_guess(message: types.Message):
+    game_key = (message.chat.id, message.from_user.id)
+    if game_key in guess_games:
+        await message.reply("Вы уже угадываете число! /cancel_guess для выхода.")
+        return
+    number = random.randint(1, 100)
+    guess_games[game_key] = {'number': number, 'attempts': 0}
+    await message.reply("🔢 Я загадал число от 1 до 100. Вводите предположения.")
+
+@dp.message(Command("cancel_guess"))
+async def cancel_guess(message: types.Message):
+    game_key = (message.chat.id, message.from_user.id)
+    if game_key in guess_games:
+        del guess_games[game_key]
+        await message.reply("Игра завершена.")
+    else:
+        await message.reply("Нет активной игры.")
+
+@dp.message(lambda msg: msg.text and msg.text.isdigit())
+async def guess_number(message: types.Message):
+    game_key = (message.chat.id, message.from_user.id)
+    if game_key not in guess_games:
+        return
+    game = guess_games[game_key]
+    guess = int(message.text)
+    game['attempts'] += 1
+    target = game['number']
+    if guess < target:
+        await message.reply("⬆️ Моё число больше!")
+    elif guess > target:
+        await message.reply("⬇️ Моё число меньше!")
+    else:
+        reward = max(50 - game['attempts'] * 2, 10)
+        await message.reply(
+            f"🎉 Поздравляю! Ты угадал число {target} за {game['attempts']} попыток!\n"
+            f"Вы получили {reward} монет!"
+        )
+        user = message.from_user
+        current = get_user_stats(user.id)
+        if current and (current[6] is None or game['attempts'] < current[6]):
+            cursor.execute('UPDATE users SET guess_attempts_best = ? WHERE user_id = ?',
+                           (game['attempts'], user.id))
+            conn.commit()
+        update_user_stats(user.id, user.username, user.first_name, games_played=1, games_won=1)
+        add_coins(user.id, reward)
+        del guess_games[game_key]
+
+# ========== КАМЕНЬ-НОЖНИЦЫ-БУМАГА ==========
+@dp.message(Command("rps"))
+async def cmd_rps(message: types.Message):
+    keyboard = rps_get_keyboard()
+    await message.reply("Выберите ваш ход:", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("rps_"))
+async def rps_callback(callback: CallbackQuery):
+    user_choice = callback.data.split('_')[1]
+    bot_choice = random.choice(list(RPS_EMOJI.keys()))
+    user_emoji = RPS_EMOJI[user_choice]
+    bot_emoji = RPS_EMOJI[bot_choice]
+
+    if user_choice == bot_choice:
+        result = "Ничья!"
+        win = 0
+        coins = 5
+    elif RPS_BEATS[user_choice] == bot_choice:
+        result = "Вы выиграли! 🎉"
+        win = 1
+        coins = 20
+    else:
+        result = "Бот выиграл! 🤖"
+        win = 0
+        coins = 0
+
+    text = (f"{user_emoji} Вы: {user_choice}\n"
+            f"{bot_emoji} Бот: {bot_choice}\n\n"
+            f"{result}")
+    
+    if coins:
+        text += f"\n+{coins} монет"
+        add_coins(callback.from_user.id, coins)
+    
+    await callback.message.edit_text(text)
+    update_user_stats(callback.from_user.id, callback.from_user.username,
+                     callback.from_user.first_name, games_played=1, games_won=win)
+    await callback.answer()
+
+# ========== ТАБЛИЦА ЛИДЕРОВ ==========
+@dp.message(Command("leaderboard"))
+async def cmd_leaderboard(message: types.Message):
+    cursor.execute('''
+        SELECT first_name, games_won, coins FROM users
+        ORDER BY games_won DESC
+        LIMIT 10
+    ''')
+    top = cursor.fetchall()
+    if not top:
+        await message.reply("Пока нет данных для таблицы лидеров.")
+        return
+    text = "🏆 <b>Таблица лидеров (по победам)</b>\n\n"
+    for i, (name, wins, coins) in enumerate(top, 1):
+        text += f"{i}. {name} — {wins} побед | {coins}💰\n"
+    await message.reply(text)
+
+# ========== ПРИВЕТСТВИЕ В ГРУППЕ ==========
+@dp.my_chat_member()
+async def on_bot_added(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status == "member":
+        chat = event.chat
+        await bot.send_message(
+            chat.id,
+            f"👋 Привет, {chat.title}! Я игровой бот. Список игр: /start"
+        )
+
+# ========== ЗАПУСК ==========
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
